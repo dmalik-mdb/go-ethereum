@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
+	"github.com/ethereum/go-ethereum/ethdb/mongodb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/olekukonko/tablewriter"
 )
@@ -279,6 +280,14 @@ func NewDatabaseWithFreezer(db ethdb.KeyValueStore, ancient string, namespace st
 		KeyValueStore: db,
 		AncientStore:  frdb,
 	}, nil
+}
+
+func NewMongoDBDatabase(file string) (ethdb.Database, error) {
+	db, err := mongodb.New(file)
+	if err != nil {
+		return nil, err
+	}
+	return NewDatabase(db), nil
 }
 
 // NewMemoryDatabase creates an ephemeral in-memory key-value database without a

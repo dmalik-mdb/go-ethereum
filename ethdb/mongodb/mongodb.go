@@ -1,13 +1,13 @@
-package ethdb
+package mongodb
 
 import (
 	"context"
-	"sync"
+	"encoding/hex"
+	"errors"
 	"time"
 
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/metrics"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -17,27 +17,14 @@ type Database struct {
 	fn string // filename for reporting
 	db *mongo.Database
 
-	getTimer        metrics.Timer // Timer for measuring the database get request counts and latencies
-	putTimer        metrics.Timer // Timer for measuring the database put request counts and latencies
-	delTimer        metrics.Timer // Timer for measuring the database delete request counts and latencies
-	missMeter       metrics.Meter // Meter for measuring the missed database get requests
-	readMeter       metrics.Meter // Meter for measuring the database get request data usage
-	writeMeter      metrics.Meter // Meter for measuring the database put request data usage
-	batchPutTimer   metrics.Timer
-	batchWriteTimer metrics.Timer
-	batchWriteMeter metrics.Meter
-
-	quitLock sync.Mutex // Mutex protecting the quit channel access
-
 	log log.Logger // Contextual logger tracking the database path
 }
 
 type KV struct {
-	key   []byte
-	value []byte
+	Key   string `bson:"key"`
+	Value string `bson:"value"`
 }
 
-// NewBadgerDatabase returns a BadgerDB wrapped object.
 func New(file string) (*Database, error) {
 	logger := log.New("database", file)
 
@@ -62,76 +49,54 @@ func New(file string) (*Database, error) {
 	return mdb, nil
 }
 
-// Close deallocates the internal map and ensures any consecutive data access op
-// failes with an error.
 func (db *Database) Close() error {
 	db.db.Client().Disconnect(context.Background())
-
 	db.db = nil
 	return nil
 }
 
 func (db *Database) Has(key []byte) (bool, error) {
 	var result KV
-	err := db.db.Collection("ethdb").FindOne(context.TODO(), bson.D{{"key", key}}).Decode(&result)
 	hasKey := false
-	if err == nil {
+
+	opts := options.FindOneOptions{}
+	opts.SetProjection(bson.D{{"_id", -1}, {"key", 1}, {"value", -1}})
+	err := db.db.Collection("ethdb").FindOne(context.TODO(), bson.D{{"key", hex.EncodeToString(key)}}, &opts).Decode(&result)
+	if err != nil {
+		return hasKey, err
+	} else {
 		hasKey = true
+		return hasKey, err
 	}
-	return hasKey, err
 }
 
 // Get returns the given key if it's present.
 func (db *Database) Get(key []byte) ([]byte, error) {
-	// Measure the database get latency, if requested
-	if db.getTimer != nil {
-		defer db.getTimer.UpdateSince(time.Now())
-	}
-
 	var result KV
 
-	err := db.db.Collection("ethdb").FindOne(context.TODO(), bson.D{{"key", key}}).Decode(&result)
-
+	opts := options.FindOneOptions{}
+	opts.SetProjection(bson.D{{"_id", -1}, {"key", 1}, {"value", 1}})
+	err := db.db.Collection("ethdb").FindOne(context.TODO(), bson.D{{"key", hex.EncodeToString(key)}}, &opts).Decode(&result)
 	if err != nil {
 		return nil, err
 	}
-
-	if db.readMeter != nil {
-		db.readMeter.Mark(int64(len(result.value)))
-	}
-	if err != nil {
-		if db.missMeter != nil {
-			db.missMeter.Mark(1)
-		}
-		return nil, err
-	}
-
-	return result.value, nil
+	return hex.DecodeString(result.Value)
 }
 
 // Put puts the given key / value to the queue
 func (db *Database) Put(key []byte, value []byte) error {
-
-	if db.putTimer != nil {
-		defer db.putTimer.UpdateSince(time.Now())
-	}
-
-	if db.writeMeter != nil {
-		db.writeMeter.Mark(int64(len(value)))
-	}
-
 	hasKey, err := db.Has(key)
 
-	if err != nil {
+	if err != nil && err != mongo.ErrNoDocuments {
 		return err
 	}
 	if hasKey {
-		filter := bson.D{{"key", key}}
-		update := bson.D{{"$set", bson.D{{"key", key}, {"value", value}}}}
+		filter := bson.D{{"key", hex.EncodeToString(key)}}
+		update := bson.D{{"$set", bson.D{{"key", hex.EncodeToString(key)}, {"value", hex.EncodeToString(value)}}}}
 		_, err := db.db.Collection("ethdb").UpdateOne(context.TODO(), filter, update)
 		return err
 	} else {
-		doc := bson.D{{"key", key}, {"value", value}}
+		doc := bson.D{{"key", hex.EncodeToString(key)}, {"value", hex.EncodeToString(value)}}
 		_, err := db.db.Collection("ethdb").InsertOne(context.TODO(), doc)
 		return err
 	}
@@ -139,12 +104,8 @@ func (db *Database) Put(key []byte, value []byte) error {
 
 // Delete deletes the key from the queue and database
 func (db *Database) Delete(key []byte) error {
-	// Measure the database delete latency, if requested
-	if db.delTimer != nil {
-		defer db.delTimer.UpdateSince(time.Now())
-	}
 
-	filter := bson.D{{"key", key}}
+	filter := bson.D{{"key", hex.EncodeToString(key)}}
 	result, err := db.db.Collection("ethdb").DeleteOne(context.TODO(), filter)
 
 	if err == nil {
@@ -161,6 +122,10 @@ func (db *Database) NewBatch() ethdb.Batch {
 	return &batch{db: db.db}
 }
 
+func (db *Database) NewBatchWithSize(size int) ethdb.Batch {
+	return &batch{db: db.db}
+}
+
 type batch struct {
 	db     *mongo.Database
 	models []mongo.WriteModel
@@ -169,14 +134,14 @@ type batch struct {
 
 // Put inserts the given value into the batch for later committing.
 func (b *batch) Put(key, value []byte) error {
-	b.models = append(b.models, mongo.NewInsertOneModel().SetDocument(bson.D{{"key", key}, {"value", value}}))
+	b.models = append(b.models, mongo.NewInsertOneModel().SetDocument(bson.D{{"key", hex.EncodeToString(key)}, {"value", hex.EncodeToString(value)}}))
 	b.size += 1
 	return nil
 }
 
 // Delete inserts the a key removal into the batch for later committing.
 func (b *batch) Delete(key []byte) error {
-	b.models = append(b.models, mongo.NewDeleteOneModel().SetFilter(bson.D{{"key", key}}))
+	b.models = append(b.models, mongo.NewDeleteOneModel().SetFilter(bson.D{{"key", hex.EncodeToString(key)}}))
 	b.size += 1
 	return nil
 }
@@ -190,7 +155,6 @@ func (b *batch) ValueSize() int {
 func (b *batch) Write() error {
 	opts := options.BulkWrite().SetOrdered(true)
 	_, err := b.db.Collection("ethdb").BulkWrite(context.TODO(), b.models, opts)
-
 	if err != nil {
 		return err
 	} else {
@@ -206,9 +170,8 @@ func (b *batch) Reset() {
 
 // Replay replays the batch contents.
 func (b *batch) Replay(w ethdb.KeyValueWriter) error {
-	opts := options.BulkWrite().SetOrdered(false)
+	opts := options.BulkWrite().SetOrdered(true)
 	_, err := b.db.Collection("ethdb").BulkWrite(context.TODO(), b.models, opts)
-
 	if err != nil {
 		return err
 	} else {
@@ -217,20 +180,30 @@ func (b *batch) Replay(w ethdb.KeyValueWriter) error {
 }
 
 type iterator struct {
-	db *mongo.Database
-	// cursor *mongo.Cursor
-	skip  int
-	key   []byte
-	value []byte
-	err   error
+	db     *mongo.Database
+	cursor *mongo.Cursor
+	key    []byte
+	value  []byte
+	err    error
 }
 
-func (db *Database) NewIterator() ethdb.Iterator {
+func (db *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
+	var pr = hex.EncodeToString(prefix)
+	var st = hex.EncodeToString(append(prefix, start...))
+
+	opts := options.FindOptions{}
+	opts.SetProjection(bson.D{{"_id", -1}, {"key", 1}, {"value", 1}})
+	opts.SetSort(bson.D{{"key", 1}})
+	filter := bson.D{{"$text", bson.D{{"$search", pr}}}, {"key", bson.D{{"$lte", st}}}}
+
+	cursor, err := db.db.Collection("ethdb").Find(context.TODO(), filter, &opts)
+
 	return &iterator{
-		db:    db.db,
-		key:   make([]byte, 0),
-		value: make([]byte, 0),
-		skip:  0,
+		db:     db.db,
+		cursor: cursor,
+		key:    make([]byte, 0),
+		value:  make([]byte, 0),
+		err:    err,
 	}
 }
 
@@ -247,45 +220,22 @@ func (i *iterator) Value() []byte {
 }
 
 func (i *iterator) Next() bool {
-	var key []byte
-	var value []byte
-	var result KV
-
-	opts := options.FindOne().SetSort(bson.D{{"key", 1}}).SetSkip(int64(i.skip + 1))
-	err := i.db.Collection("ethdb").FindOne(context.TODO(), bson.D{{"key", key}}, opts).Decode(&result)
-
-	if err != nil {
-		i.err = err
-		return false
-	}
-
-	i.key = key
-	i.value = value
-	i.skip += 1
-	return true
-}
-
-func (i *iterator) Prev() bool {
-	var key []byte
-	var value []byte
-	var result KV
-
-	opts := options.FindOne().SetSort(bson.D{{"key", 1}}).SetSkip(int64(i.skip - 1))
-	err := i.db.Collection("ethdb").FindOne(context.TODO(), bson.D{{"key", key}}, opts).Decode(&result)
-
-	if err != nil {
-		i.err = err
-		return false
-	}
-
-	i.key = key
-	i.value = value
-	i.skip -= 1
-	return true
+	return i.cursor.Next(context.TODO())
 }
 
 func (i *iterator) Release() {
-	i.key = nil
-	i.value = nil
-	i.skip = 0
+	defer i.cursor.Close(context.TODO())
+	i.key, i.value = nil, nil
+}
+
+func (db *Database) Compact(start []byte, limit []byte) error {
+	return nil
+}
+
+func (db *Database) NewSnapshot() (ethdb.Snapshot, error) {
+	return nil, nil
+}
+
+func (db *Database) Stat(property string) (string, error) {
+	return "", errors.New("unknown property")
 }

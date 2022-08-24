@@ -30,7 +30,7 @@ func New(file string) (*Database, error) {
 
 	serverAPIOptions := options.ServerAPI(options.ServerAPIVersion1)
 	clientOptions := options.Client().
-		ApplyURI("mongodb+srv://main_user:Passw0rd@cluster0.us76j.mongodb.net/?retryWrites=true&w=majority").
+		ApplyURI("mongodb+srv://[USERNAME]:[PASSWORD]@[CLUSTER]/?retryWrites=true&w=majority").
 		SetServerAPIOptions(serverAPIOptions)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
